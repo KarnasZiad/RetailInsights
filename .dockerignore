@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+**/node_modules/
+**/dist/
+**/TestResults/
+.git/
+.github/
+web/
+tests/
+docs/
+infra/

@@ -1,0 +1,57 @@
+name: retailinsights
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: retailinsights
+      POSTGRES_USER: retailinsights
+      POSTGRES_PASSWORD: retailinsights
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U retailinsights -d retailinsights"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    environment:
+      ConnectionStrings__RetailInsights: Host=postgres;Database=retailinsights;Username=retailinsights;Password=retailinsights
+      ConnectionStrings__Redis: redis:6379,abortConnect=false
+      Seed__Enabled: "true"
+      Seed__Days: "180"
+    ports:
+      - "5090:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build: ./web
+    environment:
+      API_UPSTREAM: http://api:8080
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:

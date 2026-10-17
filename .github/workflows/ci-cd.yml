@@ -1,0 +1,202 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build, tests, coverage, SonarCloud
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_ENABLED: ${{ secrets.SONAR_TOKEN != '' && vars.SONAR_ORGANIZATION != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # SonarCloud needs the history for new-code detection
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - uses: actions/setup-java@v4
+        if: env.SONAR_ENABLED == 'true'
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install tools
+        run: |
+          dotnet tool install --global dotnet-reportgenerator-globaltool
+          if [ "$SONAR_ENABLED" = "true" ]; then dotnet tool install --global dotnet-sonarscanner; fi
+
+      - name: SonarCloud - begin analysis
+        if: env.SONAR_ENABLED == 'true'
+        run: >
+          dotnet sonarscanner begin
+          /k:"${{ vars.SONAR_PROJECT_KEY }}"
+          /o:"${{ vars.SONAR_ORGANIZATION }}"
+          /d:sonar.token="$SONAR_TOKEN"
+          /d:sonar.host.url="https://sonarcloud.io"
+          /d:sonar.cs.opencover.reportsPaths="TestResults/**/coverage.opencover.xml"
+          /d:sonar.cs.vstest.reportsPaths="TestResults/**/*.trx"
+          /d:sonar.exclusions="web/**,infra/**,**/Migrations/**"
+          /d:sonar.coverage.exclusions="tests/**,**/Program.cs,**/Migrations/**,**/DemoDataGenerator.cs"
+
+      - name: Build
+        run: dotnet build -c Release
+
+      # Unit + integration tests (Testcontainers starts PostgreSQL and Redis in Docker)
+      - name: Tests with coverage
+        run: >
+          dotnet test -c Release --no-build
+          --logger trx
+          --results-directory TestResults
+          --collect:"XPlat Code Coverage"
+          -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura,opencover
+
+      - name: Coverage report
+        if: always()
+        run: |
+          reportgenerator -reports:"TestResults/**/coverage.cobertura.xml" -targetdir:coverage \
+            -reporttypes:"HtmlInline;MarkdownSummaryGithub;Badges" \
+            -classfilters:"-*.Migrations.*;-Program;-*DemoDataGenerator"
+          cat coverage/SummaryGithub.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: SonarCloud - end analysis
+        if: env.SONAR_ENABLED == 'true'
+        run: dotnet sonarscanner end /d:sonar.token="$SONAR_TOKEN"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-and-coverage
+          path: |
+            TestResults
+            coverage
+
+  web:
+    name: Dashboard build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  infra:
+    name: Validate Bicep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: az bicep build --file infra/main.bicep --stdout > /dev/null
+
+  docker:
+    name: Docker images
+    runs-on: ubuntu-latest
+    needs: [build-test, web, infra]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      api-image: ${{ steps.names.outputs.api }}
+      web-image: ${{ steps.names.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image names
+        id: names
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "api=ghcr.io/$owner/retailinsights-api:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "web=ghcr.io/$owner/retailinsights-web:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "api_latest=ghcr.io/$owner/retailinsights-api:latest" >> "$GITHUB_OUTPUT"
+          echo "web_latest=ghcr.io/$owner/retailinsights-web:latest" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.names.outputs.api }},${{ steps.names.outputs.api_latest }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Dashboard image
+        uses: docker/build-push-action@v6
+        with:
+          context: web
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.names.outputs.web }},${{ steps.names.outputs.web_latest }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+  deploy:
+    name: Deploy to Azure Container Apps
+    runs-on: ubuntu-latest
+    needs: docker
+    # Enabled once the Azure variables are configured (see README, "Déploiement").
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AZURE_CLIENT_ID != ''
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.webUrl }}
+    permissions:
+      contents: read
+      id-token: write # OpenID Connect: no Azure secret stored in GitHub
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy infrastructure and new revision
+        id: deploy
+        run: |
+          outputs=$(az deployment group create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/main.bicep \
+            --parameters apiImage="${{ needs.docker.outputs.api-image }}" \
+                         webImage="${{ needs.docker.outputs.web-image }}" \
+                         registryUsername="${{ github.actor }}" \
+                         registryPassword="${{ secrets.GHCR_PULL_TOKEN }}" \
+                         postgresAdminPassword="${{ secrets.POSTGRES_ADMIN_PASSWORD }}" \
+            --query properties.outputs -o json)
+          echo "apiUrl=$(echo "$outputs" | jq -r .apiUrl.value)" >> "$GITHUB_OUTPUT"
+          echo "webUrl=$(echo "$outputs" | jq -r .webUrl.value)" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS "${{ steps.deploy.outputs.apiUrl }}/health/ready"; then echo; exit 0; fi
+            sleep 10
+          done
+          exit 1

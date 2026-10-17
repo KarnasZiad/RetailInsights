@@ -19,6 +19,9 @@ public sealed partial class DatabaseInitializer(
     TimeProvider clock,
     ILogger<DatabaseInitializer> logger)
 {
+    // The .NET 8 [LoggerMessage] generator needs an ILogger field (primary constructor parameters are not supported).
+    private readonly ILogger<DatabaseInitializer> _logger = logger;
+
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
         await db.Database.MigrateAsync(cancellationToken);
